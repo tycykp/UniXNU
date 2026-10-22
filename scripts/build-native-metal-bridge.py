@@ -17,13 +17,16 @@ PIN = json.loads((ROOT / 'scripts/data/gpu-metal-vulkan-inputs.json').read_text(
 SOURCE = ROOT / '.cache/gpu-reference/metal2vulkan'
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--target', choices=['ios', 'host'], default='ios')
+parser.add_argument('--manifest-only', action='store_true',
+                    help='write build/native-metal-bridge/Cargo.toml (patched source, fixtures) and stop before cargo, for `cargo fetch`')
 args = parser.parse_args()
 if subprocess.check_output(['git', '-C', str(SOURCE), 'rev-parse', 'HEAD'], text=True).strip() != PIN:
     raise SystemExit('Translator revision differs from the qualified source pin')
 PATCHES = [ROOT / 'drivers/NativeMetal/bridge/patches' / name for name in [
     '0001-optional-constant-output-members.patch', '0002-resource-wait-storage-dependencies.patch',
     '0003-cache-device-entry-point-priming.patch', '0004-fold-constant-global-field-loads.patch',
-    '0005-keep-module-decodes-and-profile-fingerprints.patch']]
+    '0005-keep-module-decodes-and-profile-fingerprints.patch', '0006-skip-draws-without-a-pipeline.patch',
+    '0007-accept-two-plane-rgb-surfaces.patch']]
 tree_diff = subprocess.check_output(['git', '-C', str(SOURCE), 'diff', 'HEAD', '--'], text=True)
 def canonical_diff(diff):
     # Independent patches touch disjoint files; Git orders the combined diff by
@@ -68,6 +71,9 @@ manifest.write_text('\n'.join([
     'sha2 = { version = "0.10", features = ["asm"] }',
     '[profile.release]', 'panic = "unwind"', 'debug = 1', '',
 ]))
+if args.manifest_only:
+    print(manifest)
+    raise SystemExit(0)
 triple = 'aarch64-apple-ios' if args.target == 'ios' else 'aarch64-apple-darwin'
 env = dict(os.environ, NMB_FIXTURE_AIR=str(air), NMB_FC_AIR=str(fc_air), IPHONEOS_DEPLOYMENT_TARGET='17.0', MACOSX_DEPLOYMENT_TARGET='14.0')
 target_dir = ROOT / 'build/m2v-target'

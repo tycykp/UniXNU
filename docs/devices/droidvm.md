@@ -16,7 +16,8 @@ The DroidVM target runs UniXNU as a guest under crosvm on the Gunyah hypervisor 
 | Desktop | lock screen about a minute after boot; home screen after a Home press; CPU-rendered on SM8650 |
 | Data | persistent through the store disk on SM8650 |
 | Input | touch screen and Home over virtio-input |
-| GPU | missing; a VM needs a virtio-gpu native-context path |
+| Network | en0 over virtio-net on virtio-mmio, bridged to the phone's Wi-Fi; DHCP IPv4 and IPv6 (SM8650) |
+| GPU | NativeAdreno over the host phone's KGSL through crosvm `--droidvm-gpu`; the widget renderer and icon services draw through the Metal plugin; full GPU apps not qualified |
 
 `BigfootACA/unixnu-droidvm-ci` provides CI builds for the QEMU/KVM and DroidVM targets.
 

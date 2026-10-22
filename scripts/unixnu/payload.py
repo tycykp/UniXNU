@@ -8,6 +8,7 @@ Inputs that are not in a repository are options: the prelinked kernel (default: 
 "build kernel"), --trust-cache, --data-ramdisk and the platform seed --unique-chip-id.
 The volume is written with mtools, without mounting, so it is the same on every run.
 """
+import hashlib
 import json
 import os
 import re
@@ -63,18 +64,20 @@ def write_volume(stage, image, label, size_mib):
         run(['mcopy', '-i', image, '-s', '-Q', '-m', entry, '::/'], env=env, capture=True)
 
 
-def skip_setup_seed(ctx, base, tool_path):
-    """A copy of the Data seed whose preferences mark Setup (the Hello pages) as done; cached by the hash of the base."""
+def skip_setup_seed(ctx, base, tool_path, tool_args=()):
+    """A copy of the Data seed whose preferences mark Setup (the Hello pages) as done; cached by the hash of the base and the
+    tool's extra arguments (board.toml [payload] skip_setup_args)."""
     tool('hdiutil')
     out = paths(ctx)[0]
     out.mkdir(parents=True, exist_ok=True)
-    seed = out / f'data-skip-setup-{sha256_file(base)[:12]}.dbr'
+    key = sha256_file(base)[:12] + (('-' + hashlib.sha256(' '.join(tool_args).encode()).hexdigest()[:8]) if tool_args else '')
+    seed = out / f'data-skip-setup-{key}.dbr'
     if not seed.is_file():
         log('payload: marking Setup as done in a copy of the Data seed (mounts the seed read-write, no root needed)')
         for stale in out.glob('data-skip-setup-*'):
             stale.unlink()
         (ctx.tree / 'build').mkdir(exist_ok=True)
-        run(['python3', ctx.tree / tool_path, base, seed], cwd=ctx.tree, log_file=ctx.logs / 'payload-skip-setup.log')
+        run(['python3', ctx.tree / tool_path, base, seed, *tool_args], cwd=ctx.tree, log_file=ctx.logs / 'payload-skip-setup.log')
     return seed
 
 
@@ -109,7 +112,7 @@ def build(ctx, kernel=None):
             raise Error('--skip-setup edits the Data seed: pass the original one with --data-ramdisk FILE')
         if not spec.get('skip_setup_tool'):
             raise Error('board.toml [payload] has no skip_setup_tool')
-        data = skip_setup_seed(ctx, data, spec['skip_setup_tool'])
+        data = skip_setup_seed(ctx, data, spec['skip_setup_tool'], [str(arg) for arg in spec.get('skip_setup_args', [])])
     addon = expand(args.gpu_addon) if getattr(args, 'gpu_addon', None) else None
     if addon and (not addon.is_file() or addon.read_bytes()[:8] != b'NGPUADD2'):
         raise Error(f'GPU addon not found or not made by scripts/make-gpu-addon.py: {addon}')
@@ -123,8 +126,19 @@ def build(ctx, kernel=None):
     payloads = stage / 'EFI/UniXNU/Payloads'
     payloads.mkdir(parents=True)
     shutil.copyfile(kernel, payloads / 'kernel.macho')
-    if spec.get('panic_screen'):
-        run(['python3', ctx.tree / 'scripts/patch-xnu-entry-probe.py', payloads / 'kernel.macho', '--panic-screen', '--no-reset'],
+    # The entry probe (stage bars, optional reset) is wanted with either setting; the panic screen is only one part of it.
+    if spec.get('panic_screen') or spec.get('entry_probe_reset_delay'):
+        probe = (['--reset-delay', str(int(spec['entry_probe_reset_delay']))]
+                 if spec.get('entry_probe_reset_delay') else ['--no-reset'])
+        screen = ['--panic-screen'] if spec.get('panic_screen') else []
+        if spec.get('entry_probe_reset_delay') and spec.get('entry_probe_reset_after'):
+            # Stage 4 in place of stage 3: reset after the Nth call to SYMBOL in FUNCTION.
+            probe += ['--reset-after', spec['entry_probe_reset_after'], '--in', spec.get('entry_probe_reset_in', '_arm_init'),
+                      '--occurrence', str(int(spec.get('entry_probe_reset_occurrence', 1)))]
+            if spec.get('entry_probe_reset_before'):
+                # At the call site, without making the call (and without the delay).
+                probe.append('--reset-before')
+        run(['python3', ctx.tree / 'scripts/patch-xnu-entry-probe.py', payloads / 'kernel.macho', *screen, *probe],
             cwd=ctx.tree, env=dict(os.environ, UNIXNU_UEFI=str(ctx.uefi or '')), log_file=ctx.logs / 'payload-patch.log')
     if trust:
         shutil.copyfile(trust, payloads / 'kernel.macho.trustcache')

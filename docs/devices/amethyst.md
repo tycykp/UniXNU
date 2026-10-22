@@ -1,14 +1,14 @@
 # Redmi Note 14 Pro+ 5G (amethyst)
 
-amethyst is the Redmi Note 14 Pro+ 5G with the SM7635 SoC. The port below is an independent community project. The UniXNU organization does not maintain it.
+amethyst is the Redmi Note 14 Pro+ 5G with the SM7635 SoC. The port below is an independent community project. The UniXNU organization does not maintain it. The target is the iPhone X (iPhone10,3) userland.
 
 | Repository | Maintainer | State |
 | --- | --- | --- |
-| [UniXNU-amethyst](https://github.com/andr0d1v/UniXNU-amethyst) | [andr0d1v](https://github.com/andr0d1v) | Work in progress; status not documented |
+| [UniXNU-amethyst](https://github.com/andr0d1v/UniXNU-amethyst) | [andr0d1v](https://github.com/andr0d1v) | Board file and kernel config; no hardware run documented |
 
 ## State
 
-The repository is present. Its README is a short work-in-progress description and does not record a bring-up stage. Check the repository for the current board values and progress.
+The repository contains `board.toml`, `configs/amethyst_defconfig` and `scripts/check-amethyst.py`. The README is a short work-in-progress description. It does not record a hardware run.
 
 ## Maintenance
 

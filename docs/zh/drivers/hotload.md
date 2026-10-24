@@ -16,7 +16,7 @@ NativeHotload 为固定版本 `xnu-8796.141.3` / Darwin 22 提供显式启用的
 
 镜像声明模块名、递增构建版本、CALL 接口 ABI、序列化状态 ABI、类别及依赖。依赖要求接口 ABI 完全匹配、构建版本满足下限。缺失依赖、重复／自依赖和循环依赖会在停止旧代码前拒绝。同名热替换保持接口 ABI、状态 ABI 和类别一致；有运行中或隔离模块依赖某个提供者时，禁止卸载该提供者。
 
-常驻调用者通过 `nlh_dispatch(name, interface_abi, argument, result)` 进入模块；模块通过 `host->call` 调用已声明依赖，不保留其他模块的函数指针。入口使用原子计数固定活动镜像，不睡眠、不分配内存。CALL 可以并发，模块负责状态同步，并遵守调用者的执行上下文。
+普通标量服务通过 `nlh_dispatch(name, interface_abi, argument, result)` 进入模块；模块通过 `host->call` 调用已声明依赖，不保留其他模块的函数指针。入口使用原子计数固定活动镜像，不睡眠、不分配内存。CALL 可以并发，模块负责状态同步，并遵守调用者的执行上下文。
 
 替换流程：
 
@@ -31,6 +31,20 @@ EXPORT 不得修改旧实例或转移资源所有权；IMPORT 只修改候选私
 旧 STOP、候选清理或旧实例恢复失败时，目标进入隔离状态，其依赖方保持入口关闭。可能仍被引用的代码和状态保留到重启，不提供强制卸载。回调必须有界返回；排空时限不能抢占出错的原生代码。
 
 切换期间入口返回 EBUSY，常驻适配器必须提供经过验证的重试／回退路径，不能持有 STOP 所需资源等待恢复。VM、调度和中断上下文尤其需要分别设计；通用入口本身不等于这些路径已可替换。
+
+## 可信常驻平台调用
+
+镜像头仍为 432 字节的 NLH2，`nlh_host` 仍为原有 48 字节 ABI。常驻 provider 使用独立的 `NLH_PLATFORM_ABI=1`：首次上传前，以 `nlh_register_platform_v2(abi, callback)` 一次性注册。旧的仅按名称回调注册符号 `nlh_register_platform` 返回 ENOTSUP；provider 必须显式迁移到新接口。模块的 host 函数表没有安装 provider 的入口。
+
+每次原生入口使用新的栈上 host；context 是不复用的不透明 invocation token，不是地址。平台和依赖回调前，runtime 将 token 与当前 thread 最内层活动调用匹配；伪造、已退出、跨线程及父调用 token 均返回 EACCES，模块不能通过参数自报身份或 phase。provider 收到借用的 const `nlh_invocation` 快照，包含已验证名称、version、interface/state ABI、kind、依赖数、摘要，以及 image cookie、槽 generation、activation epoch、invocation/root ID、phase、role、origin/depth 和入口原始 argument。回调返回后不得保留快照或 host/context。
+
+只有 `nlh_dispatch_resident(name, interface_abi, argument, result)` 将直接调用标记为 RESIDENT。常驻适配器持有 argument 标识的有界请求，检查输出后才提交原有硬件流程。普通入口、USB `hl.call` 分别标记 GENERIC、USB；已声明依赖始终标记 DEPENDENCY，并增加 depth。root_origin 仅用于诊断，不产生权限。已有 module/provider 活动帧内的常驻 dispatch 和 provider 注册均拒绝，避免依赖重新制造 resident root。USB 标量不会被解释为内核地址。
+
+PROBE、EXPORT、IMPORT 在到达 provider 前拒绝平台和依赖回调。START/STOP/CALL 保留真实 phase 和镜像 role，provider 仍须检查自身类型、操作与资源规则。纯协议桥应严格要求 RESIDENT、depth=0、ACTIVE、CALL、精确模块元数据及匹配 ticket。候选 PROBE 早于旧 STOP，不能覆盖另一次调用的暂存输出。
+
+每次候选尝试预留不复用的 slot generation 和 image cookie，仅成功 START 才发布 generation。每次 START 尝试均推进 activation epoch，包括恢复旧镜像的 rollback START；失败候选 cleanup STOP 使用该候选 START 的 epoch，旧 STOP/EXPORT 保留之前的 epoch。因此同版本旧镜像恢复后也不能沿用前一次激活的请求。STOP、清理或恢复失败继续保持隔离、依赖闭合和代码/状态保留直到重启。这些是模块代次，不是硬件 reset、DMA 排空或 owner 租约证明。
+
+`hl.status` 增加 `platform_abi=1 resident_dispatch=1`，`hl.list` 输出活动 cookie/epoch 及保留候选身份。此接口需要重编内核，并在上传前真实链接注册常驻桥；早先 15 个策略的实机验收早于该接口，不能作为新 runtime 或硬件驱动热替换的验收证据。
 
 ## 已接入的 XNU 核心算法
 
@@ -121,6 +135,8 @@ python3 kits/NativeHotload/build-module.py --source kits/NativeHotload/examples/
 ```
 
 构建器保留 x18，禁用 SIMD/FP 和外置原子辅助函数；在静态链接隐藏重定位前检查目标文件，拒绝绝对重定位、未解析导入、可写全局、TLS 和构造函数。输出经过校验的镜像与来源 JSON。每个源文件声明 `const uint32_t nlh_state_bytes = sizeof(state)`；通过 `--interface-abi`、`--state-abi`、`--kind service|driver|core` 描述模块契约。
+
+构建器先以相同 target、宏和 include 参数运行 Clang `-MM`，记录实际非系统依赖闭包及摘要；编译产生的 `-MMD` 依赖集合、各文件摘要必须与预检一致。发布前再次核对源码、kit 工具及 compiler/linker 身份，`module.json` 将输入、编译/链接参数与 image、object/ELF 摘要绑定。镜像与清单读回一致后，才将同级暂存目录原子更名为新的输出目录；失败不发布模块目录。同级独占 `.build-lock` 避免多个构建器同时写同一输出；崩溃后保留锁，检查后显式清理。
 
 启动新内核后，退出投屏／PTY 模式、关闭其他串口终端，安装设备项目固定版本的 pyserial。在 Windows CMD 执行，COM7 换成实际端口，每条命令使用新日志路径：
 

@@ -20,6 +20,18 @@
 #define NLH_DRIVER 1u
 #define NLH_CORE 2u
 
+/* Resident provider ABI, independent of the unchanged NLH2 image/host ABI. */
+#define NLH_PLATFORM_ABI 1u
+#define NLH_ROLE_ACTIVE 1u
+#define NLH_ROLE_CANDIDATE 2u
+#define NLH_ROLE_ROLLBACK 3u
+#define NLH_ORIGIN_GENERIC 1u
+#define NLH_ORIGIN_USB 2u
+#define NLH_ORIGIN_RESIDENT 3u
+#define NLH_ORIGIN_DEPENDENCY 4u
+#define NLH_ORIGIN_MANAGEMENT 5u
+#define NLH_ORIGIN_CORE 6u
+
 struct nlh_dependency {
     char name[32];
     uint32_t interface_abi, minimum_version;
@@ -54,7 +66,9 @@ struct nlh_transfer {
  * Interrupt/scheduler/VM use requires its own audited resident adapter.
  * STOP=0 retires DMA, IRQs, threads and external references, including partial
  * START. PROBE and EXPORT have no side effects; IMPORT touches private state
- * only. START works on zero, imported, or stopped state. Callbacks are bounded. */
+ * only. START works on zero, imported, or stopped state. Callbacks are bounded.
+ * host/context are borrowed for this invocation on this thread only. context
+ * is an opaque token, not an address; never inspect or retain it. */
 struct nlh_host {
     uint32_t abi, bytes;
     void *context;
@@ -67,11 +81,39 @@ typedef int (*nlh_entry_fn)(const struct nlh_host *, void *state,
                           uint32_t operation, uint64_t argument, uint64_t *result);
 
 #ifdef KERNEL
+/* These identities are runtime-owned snapshots, never module-supplied claims.
+ * Retaining this pointer or any host/context pointer beyond entry is invalid.
+ * A digest establishes image integrity, not signature authorization. */
+struct nlh_module_identity {
+    char name[32];
+    uint32_t version, interface_abi, state_abi, kind, dependency_count;
+    unsigned char sha256[32];
+};
+
+struct nlh_invocation {
+    uint32_t abi, bytes;
+    struct nlh_module_identity metadata;
+    uint64_t image_cookie, activation_epoch, invocation_id;
+    uint64_t root_invocation_id, argument;
+    uint32_t slot_generation, phase, role, origin, root_origin, depth;
+};
+
 int nlh_command(const char *command);
 void nlh_disconnect(void);
+/* Scalar-only generic entry. It never confers resident request authority. */
 int nlh_dispatch(const char *name, uint32_t interface_abi, uint64_t argument,
                  uint64_t *result);
-/* Register once before the first upload; provider remains resident. */
+/* Only resident code may construct the typed request represented by argument.
+ * Dependencies and USB CALL cannot acquire this dispatch provenance. */
+int nlh_dispatch_resident(const char *name, uint32_t interface_abi,
+                          uint64_t argument, uint64_t *result);
+/* Register once before the first upload; provider and its code remain resident.
+ * PROBE/EXPORT/IMPORT cannot call platform or a dependency. A provider must
+ * enforce its own operation, phase, role, epoch and typed-request permissions.
+ * root_origin is diagnostic and MUST NOT grant dependency invocations access. */
+int nlh_register_platform_v2(uint32_t abi,
+    int (*call)(const struct nlh_invocation *, uint32_t, uint64_t, uint64_t, uint64_t *));
+/* Kept for source/link compatibility; the unauthenticated API returns ENOTSUP. */
 int nlh_register_platform(uint32_t abi,
     int (*call)(const char *, uint32_t, uint64_t, uint64_t, uint64_t *));
 int nlh_memory_enabled(void);

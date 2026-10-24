@@ -50,7 +50,7 @@ duplicate/self dependencies and cycles are rejected before stopping old code.
 In-place replacements preserve the interface/state ABI and kind. Unload is
 refused while any live or quarantined module depends on the provider.
 
-Resident callers enter `nlh_dispatch(name, interface_abi, argument, result)`.
+Scalar service callers enter `nlh_dispatch(name, interface_abi, argument, result)`.
 Modules call declared dependencies through `host->call`; they never retain
 another module's function pointer. The gateway atomically pins the active
 image without sleeping or allocating. CALL may run concurrently; each module
@@ -83,6 +83,59 @@ Admission returns EBUSY during a transition. A resident adapter must implement
 a validated retry/fallback path without holding resources needed by STOP.
 This requirement is especially significant for VM, scheduler and interrupt
 contexts; the generic gateway alone does not make those paths replaceable.
+
+## Authenticated resident platform calls
+
+The image header remains NLH2 (432 bytes), and `nlh_host` remains the same
+48-byte ABI. The resident provider API has its own `NLH_PLATFORM_ABI=1`:
+`nlh_register_platform_v2(abi, callback)` registers one resident callback before
+the first upload. The old name-only `nlh_register_platform` symbol returns
+ENOTSUP; providers must explicitly adopt the versioned interface. Modules
+cannot install a provider through the host function table.
+
+Each native entry receives a fresh stack-local host. Its context is an opaque,
+never-reused invocation token, not an address. Before a platform or dependency
+callback, the runtime matches that token to the current thread's innermost
+active entry. Fabricated, expired, cross-thread and parent-entry tokens fail
+with EACCES. Callback arguments cannot declare a different identity or phase.
+The provider receives a borrowed const `nlh_invocation` snapshot containing the
+validated name, version, interface/state ABI, kind, dependency count and digest;
+image cookie, slot generation and activation epoch; invocation/root IDs;
+phase, role, origin/depth and the original entry argument. Nothing in this
+snapshot may be retained after the callback returns.
+
+Only `nlh_dispatch_resident(name, interface_abi, argument, result)` marks a
+direct call as RESIDENT. A resident adapter owns the bounded request identified
+by `argument` and checks the response before committing its original hardware
+path. Generic calls and USB `hl.call` carry separate GENERIC/USB origins;
+declared dependencies always carry DEPENDENCY origin and increasing depth.
+Root origin is diagnostic and confers no authority. Resident dispatch and
+provider registration reject nested module/provider paths, preventing a
+dependency from manufacturing a new resident root. USB scalar values are never
+interpreted as kernel addresses.
+
+PROBE, EXPORT and IMPORT reject both platform and dependency callbacks before
+entering a provider. START/STOP/CALL retain their real phase and image role;
+the provider must still enforce its own typed operations and resource rules.
+For a pure protocol bridge, require RESIDENT origin, depth zero, ACTIVE role,
+CALL phase, exact module metadata and the matching request ticket. Candidate
+PROBE runs before old STOP and must never alter another invocation's staging.
+
+Each candidate attempt reserves a fresh slot generation and image cookie;
+only successful START publishes that generation. Every START attempt advances
+the activation epoch, including rollback START of the old image. Candidate
+cleanup STOP uses its failed START's epoch; old STOP/EXPORT retain the previous
+epoch. A rollback therefore cannot reuse a request from the previous activation
+even though its image version is unchanged. STOP/cleanup/restart failure keeps
+the original quarantine and transitive admission closure, retaining uncertain
+code/state until reboot. These are module generations, not evidence of hardware
+reset, DMA drain or a valid hardware-owner lease.
+
+`hl.status` advertises `platform_abi=1 resident_dispatch=1`; `hl.list` reports
+active image cookies/epochs and any retained candidate identity. This requires
+a rebuilt kernel with the resident bridge linked before upload. The previous
+15-policy device validation predates this interface; it does not establish
+hardware-driver replacement or validation of the new runtime.
 
 ## Connected XNU core algorithms
 
@@ -242,6 +295,17 @@ The builder preserves x18, disables SIMD/FP and outline atomics, and rejects
 absolute object relocations, undefined imports, writable globals, TLS and
 constructors. It emits a checked image and provenance JSON. Declare
 `const uint32_t nlh_state_bytes = sizeof(state)` in each source.
+
+The builder first runs Clang `-MM` with the same target, defines and include
+flags, then hashes the actual non-system dependency closure. Compilation's
+`-MMD` dependency set and every input hash must match that preflight; the
+builder rechecks inputs, kit tooling and compiler/linker identities before
+publication. `module.json` binds those inputs and compile/link parameters to
+the image and object/ELF hashes. A sibling staging directory is atomically
+renamed to the new output only after image and manifest readback succeeds;
+failed builds publish no module directory. An exclusive sibling `.build-lock`
+prevents concurrent builders from targeting the same output. A crash leaves
+that lock available for inspection before explicit removal.
 Use `--interface-abi`, `--state-abi` and `--kind service|driver|core`
 when defining a module's contract.
 

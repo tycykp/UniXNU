@@ -87,6 +87,15 @@ snapshot unchanged.
 Hardware conversion must separately preserve and document the complete pinned
 OnePlus upstream lifecycle. The examples do not access hardware.
 
+The resident platform API now uses `NLH_PLATFORM_ABI=1` and
+`nlh_register_platform_v2`, with per-invocation identity, phase, image role,
+origin and activation epoch. The NLH2 image/host ABI is unchanged. The old
+name-only registration returns ENOTSUP. Only direct `nlh_dispatch_resident`
+calls carry resident request authority; USB/generic/dependency calls do not.
+PROBE/EXPORT/IMPORT cannot use platform or dependency callbacks. This source
+change requires a rebuilt kernel and separate validation; the earlier policy
+device results do not validate this interface or hardware-driver replacement.
+
 License: BSD-2-Clause-Patent for original runtime/tooling and policy code.
 Adapted XNU algorithms and generated modifications to Apple source retain
 their original notices and license; see `core/LICENSE`.

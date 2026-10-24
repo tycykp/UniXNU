@@ -9,31 +9,37 @@
 #include <mach/thread_act.h>
 #include <kern/clock.h>
 #include <kern/kalloc.h>
+#include <machine/machine_routines.h>
 #include <libkern/crypto/sha2.h>
 #include "native_hotload.h"
 #include "native_hotload_core.h"
 #include "native_core_algorithms.h"
 
 _Static_assert(sizeof(struct nlh_header) == 432, "NLH2 header ABI");
+_Static_assert(sizeof(struct nlh_host) == 48, "NLH2 host ABI");
+_Static_assert(sizeof(struct nlh_invocation) == 160, "resident platform ABI 1");
 _Static_assert(__atomic_always_lock_free(sizeof(unsigned), 0), "nonblocking admission");
 _Static_assert(__atomic_always_lock_free(sizeof(uint64_t), 0), "nonblocking core counters");
+_Static_assert(sizeof(uintptr_t) == sizeof(uint64_t), "64-bit invocation tokens");
 #define NLH_CLOSED 0x80000000u
 #define NLH_COUNT  0x7fffffffu
 static LCK_GRP_DECLARE(nlh_group, "native_hotload");
 static LCK_MTX_DECLARE(nlh_lock, &nlh_group);
+static LCK_SPIN_DECLARE(nlh_context_lock, &nlh_group);
 enum { NLH_EMPTY, NLH_RUNNING, NLH_STOPPED, NLH_QUARANTINED };
 enum { NLH_UPDATE = 1, NLH_UNLOAD, NLH_INVOKE };
 struct nlh_image {
     struct nlh_header header;
-    struct nlh_host host;
     nlh_entry_fn entry;
     void *state;
+    uint64_t cookie, activation_epoch;
+    unsigned generation;
     unsigned owner, memory, dependencies[NLH_MAX_DEPENDENCIES];
 };
 static struct nlh_slot {
     /* Name/array index remain stable even after unload. Published once. */
     char name[32];
-    unsigned admission, state, active, generation;
+    unsigned admission, state, active, generation, last_generation;
     struct nlh_image images[2];
 } nlh_slots[NLH_MAX_MODULES];
 static unsigned nlh_count;
@@ -46,7 +52,129 @@ static struct {
     uint64_t argument, result;
     unsigned char upload[sizeof(struct nlh_header) + NLH_MAX_CODE];
 } nlh;
-static int (*nlh_platform_call)(const char *, uint32_t, uint64_t, uint64_t, uint64_t *);
+static int (*nlh_platform_call)(const struct nlh_invocation *, uint32_t,
+                                uint64_t, uint64_t, uint64_t *);
+static uint64_t nlh_image_serial, nlh_epoch_serial, nlh_invocation_serial;
+
+/* The module receives a unique invocation ID as an opaque context, never an
+ * address. Never dereference a context supplied to a host callback.
+ * Entries use private stack frames, so concurrent/nested calls cannot overwrite
+ * another invocation's phase, identity or resident request provenance. */
+struct nlh_frame {
+    struct nlh_frame *next;
+    struct nlh_image *image;
+    thread_t thread;
+    struct nlh_invocation invocation;
+};
+static struct nlh_frame *nlh_frames;
+
+static uint64_t nlh_now(void);
+static void nlh_log(const char *);
+static int nlh_platform(void *, uint32_t, uint64_t, uint64_t, uint64_t *);
+static int nlh_dependency_call(void *, uint32_t, uint64_t, uint64_t *);
+
+/* Bounded even for the scheduler/VM gateways. Identifiers never wrap or reuse. */
+static int nlh_identity(uint64_t *serial, uint64_t *identity)
+{
+    uint64_t value = __atomic_load_n(serial, __ATOMIC_RELAXED);
+    for (unsigned tries = 0; tries < 8; tries++) {
+        if (value == UINT64_MAX) return EOVERFLOW;
+        if (__atomic_compare_exchange_n(serial, &value, value + 1, 0,
+                __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+            *identity = value + 1;
+            return 0;
+        }
+    }
+    return EBUSY;
+}
+
+static void nlh_context_enter(struct nlh_frame *frame)
+{
+    boolean_t interrupts = ml_set_interrupts_enabled(FALSE);
+    lck_spin_lock(&nlh_context_lock);
+    frame->next = nlh_frames;
+    nlh_frames = frame;
+    lck_spin_unlock(&nlh_context_lock);
+    ml_set_interrupts_enabled(interrupts);
+}
+
+static void nlh_context_leave(struct nlh_frame *frame)
+{
+    boolean_t interrupts = ml_set_interrupts_enabled(FALSE);
+    lck_spin_lock(&nlh_context_lock);
+    struct nlh_frame **cursor = &nlh_frames;
+    while (*cursor && *cursor != frame) cursor = &(*cursor)->next;
+    if (*cursor) *cursor = frame->next;
+    lck_spin_unlock(&nlh_context_lock);
+    ml_set_interrupts_enabled(interrupts);
+}
+
+static struct nlh_frame *nlh_context_current(void)
+{
+    struct nlh_frame *match = NULL;
+    thread_t thread = current_thread();
+    boolean_t interrupts = ml_set_interrupts_enabled(FALSE);
+    lck_spin_lock(&nlh_context_lock);
+    for (struct nlh_frame *frame = nlh_frames; frame; frame = frame->next) {
+        if (frame->thread != thread) continue;
+        /* Only the innermost invocation can use callbacks. A dependency cannot
+         * reuse its parent's resident context, even on the same thread. */
+        match = frame;
+        break;
+    }
+    lck_spin_unlock(&nlh_context_lock);
+    ml_set_interrupts_enabled(interrupts);
+    return match; /* this thread owns the matching stack until entry returns */
+}
+
+static struct nlh_frame *nlh_context(void *context)
+{
+    struct nlh_frame *frame = nlh_context_current();
+    return frame && frame->invocation.invocation_id == (uint64_t)(uintptr_t)context ? frame : NULL;
+}
+
+static int nlh_execute(struct nlh_image *image, unsigned op, uint64_t argument,
+                        uint64_t *result, unsigned role, unsigned origin,
+                        const struct nlh_invocation *parent)
+{
+    struct nlh_host host = { NLH_ABI, sizeof(struct nlh_host), NULL,
+        NULL, NULL, NULL, NULL };
+    struct nlh_frame frame = { .image = image,
+        .thread = current_thread(), .invocation = {
+            .abi = NLH_PLATFORM_ABI, .bytes = sizeof(struct nlh_invocation),
+            .image_cookie = image->cookie, .activation_epoch = image->activation_epoch,
+            .argument = argument, .slot_generation = image->generation,
+            .phase = op, .role = role, .origin = origin,
+            .root_origin = parent ? parent->root_origin : origin,
+            .depth = parent ? parent->depth + 1 : 0 } };
+    int error = nlh_identity(&nlh_invocation_serial, &frame.invocation.invocation_id);
+    if (error) return error;
+    frame.invocation.root_invocation_id = parent ? parent->root_invocation_id :
+        frame.invocation.invocation_id;
+    memcpy(frame.invocation.metadata.name, image->header.name, sizeof(image->header.name));
+    frame.invocation.metadata.version = image->header.version;
+    frame.invocation.metadata.interface_abi = image->header.interface_abi;
+    frame.invocation.metadata.state_abi = image->header.state_abi;
+    frame.invocation.metadata.kind = image->header.kind;
+    frame.invocation.metadata.dependency_count = image->header.dependency_count;
+    memcpy(frame.invocation.metadata.sha256, image->header.sha256, sizeof(image->header.sha256));
+    if (image->header.kind == NLH_CORE) {
+        /* Audited non-sleeping core policies receive no external callbacks. */
+        return image->entry(&host, image->state, op, argument, result);
+    }
+    /* An address of a stack local could be reused by a later invocation. An
+     * opaque never-reused ID also rejects a retained/stale host context. */
+    host.context = (void *)(uintptr_t)frame.invocation.invocation_id;
+    host.log = nlh_log;
+    host.now_ns = nlh_now;
+    host.platform = nlh_platform;
+    host.call = nlh_dependency_call;
+    nlh_context_enter(&frame);
+    error = image->entry(&host, image->state, op, argument, result);
+    nlh_context_leave(&frame);
+    bzero(&host, sizeof(host));
+    return error;
+}
 
 static uint64_t nlh_now(void)
 {
@@ -83,7 +211,8 @@ static int nlh_find(const char *name)
  * No lock, allocation, sleeping or callback before the image is pinned.
  * Active image/header/state are immutable while any reader owns a pin. */
 static int nlh_call_slot_op(unsigned index, uint32_t abi, uint32_t minimum,
-                            unsigned operation, uint64_t argument, uint64_t *result)
+                            unsigned operation, uint64_t argument, uint64_t *result,
+                            unsigned origin, const struct nlh_invocation *parent)
 {
     struct nlh_slot *slot = &nlh_slots[index];
     unsigned value = __atomic_load_n(&slot->admission, __ATOMIC_ACQUIRE);
@@ -101,16 +230,18 @@ static int nlh_call_slot_op(unsigned index, uint32_t abi, uint32_t minimum,
     int error = EPROGMISMATCH;
     if (image->header.interface_abi == abi && image->header.version >= minimum &&
         (operation != NLH_CORE_CALL || image->header.kind == NLH_CORE))
-        error = image->entry(&image->host, image->state, operation, argument, &output);
+        error = nlh_execute(image, operation, argument, &output,
+                            NLH_ROLE_ACTIVE, origin, parent);
     __atomic_fetch_sub(&slot->admission, 1, __ATOMIC_RELEASE);
     if (result) *result = output;
     return error;
 }
 
 static int nlh_call_slot(unsigned index, uint32_t abi, uint32_t minimum,
-                         uint64_t argument, uint64_t *result)
+                         uint64_t argument, uint64_t *result, unsigned origin,
+                         const struct nlh_invocation *parent)
 {
-    return nlh_call_slot_op(index, abi, minimum, NLH_CALL, argument, result);
+    return nlh_call_slot_op(index, abi, minimum, NLH_CALL, argument, result, origin, parent);
 }
 
 uint64_t nlh_core_select(const struct nlh_core_request *request, uint64_t baseline)
@@ -127,7 +258,7 @@ uint64_t nlh_core_select(const struct nlh_core_request *request, uint64_t baseli
     }
     uint64_t result = 0;
     int error = nlh_call_slot_op(index - 1, NLH_CORE_INTERFACE, 1, NLH_CORE_CALL,
-                                (uint64_t)(uintptr_t)request, &result);
+                                (uint64_t)(uintptr_t)request, &result, NLH_ORIGIN_CORE, NULL);
     if (!error && nlh_core_result_valid(request, baseline, result)) {
         __atomic_fetch_add(&nlh_core_stats[domain].calls, 1, __ATOMIC_RELAXED);
         return result;
@@ -153,32 +284,64 @@ int nlh_dispatch(const char *name, uint32_t abi, uint64_t argument, uint64_t *re
 {
     if (!name || !nlh_name(name) || !abi) return EINVAL;
     int index = nlh_find(name);
-    return index < 0 ? ENOENT : nlh_call_slot((unsigned)index, abi, 1, argument, result);
+    return index < 0 ? ENOENT : nlh_call_slot((unsigned)index, abi, 1, argument,
+                                            result, NLH_ORIGIN_GENERIC, NULL);
+}
+
+int nlh_dispatch_resident(const char *name, uint32_t abi, uint64_t argument, uint64_t *result)
+{
+    if (!name || !nlh_name(name) || !abi) return EINVAL;
+    /* A nested module/provider/dependency path must never mint a new resident
+     * root. The adapter submits a fresh request after the outer entry returns. */
+    if (nlh_context_current()) return EACCES;
+    int index = nlh_find(name);
+    return index < 0 ? ENOENT : nlh_call_slot((unsigned)index, abi, 1, argument,
+                                            result, NLH_ORIGIN_RESIDENT, NULL);
 }
 
 static int nlh_dependency_call(void *context, uint32_t dependency,
                                uint64_t argument, uint64_t *result)
 {
-    struct nlh_image *image = context;
+    struct nlh_frame *frame = nlh_context(context);
+    if (!frame) return EACCES;
+    if (frame->invocation.phase != NLH_START && frame->invocation.phase != NLH_STOP &&
+        frame->invocation.phase != NLH_CALL) return EACCES;
+    if (frame->invocation.depth >= NLH_MAX_MODULES) return ELOOP;
+    struct nlh_image *image = frame->image;
     if (image->header.kind == NLH_CORE) return ENOTSUP;
     if (dependency >= image->header.dependency_count) return EINVAL;
     const struct nlh_dependency *dep = &image->header.dependencies[dependency];
     return nlh_call_slot(image->dependencies[dependency], dep->interface_abi,
-                         dep->minimum_version, argument, result);
+                         dep->minimum_version, argument, result,
+                         NLH_ORIGIN_DEPENDENCY, &frame->invocation);
 }
 
 static int nlh_platform(void *context, uint32_t op, uint64_t a, uint64_t b, uint64_t *out)
 {
-    struct nlh_image *image = context;
-    if (image->header.kind == NLH_CORE) return ENOTSUP;
-    return nlh_platform_call ?
-        nlh_platform_call(nlh_slots[image->owner].name, op, a, b, out) : ENOTSUP;
+    struct nlh_frame *frame = nlh_context(context);
+    if (!frame) return EACCES;
+    if (frame->invocation.phase != NLH_START && frame->invocation.phase != NLH_STOP &&
+        frame->invocation.phase != NLH_CALL) return EACCES;
+    if (frame->image->header.kind == NLH_CORE) return ENOTSUP;
+    if (!nlh_platform_call) return ENOTSUP;
+    /* The provider receives a borrowed immutable copy, not module-owned data. */
+    const struct nlh_invocation invocation = frame->invocation;
+    return nlh_platform_call(&invocation, op, a, b, out);
 }
 
 int nlh_register_platform(uint32_t abi,
     int (*call)(const char *, uint32_t, uint64_t, uint64_t, uint64_t *))
 {
-    if (abi != NLH_ABI || !call) return EINVAL;
+    (void)abi;
+    (void)call;
+    return ENOTSUP;
+}
+
+int nlh_register_platform_v2(uint32_t abi,
+    int (*call)(const struct nlh_invocation *, uint32_t, uint64_t, uint64_t, uint64_t *))
+{
+    if (abi != NLH_PLATFORM_ABI || !call) return EINVAL;
+    if (nlh_context_current()) return EACCES;
     lck_mtx_lock(&nlh_lock);
     int error = (nlh_platform_call || nlh.token || nlh.busy) ? EBUSY : 0;
     if (!error) nlh_platform_call = call;
@@ -187,9 +350,13 @@ int nlh_register_platform(uint32_t abi,
 }
 
 static int nlh_invoke(struct nlh_image *image, unsigned op, uint64_t argument,
-                      uint64_t *result)
+                      uint64_t *result, unsigned role)
 {
-    return image->entry(&image->host, image->state, op, argument, result);
+    if (op == NLH_START) {
+        int error = nlh_identity(&nlh_epoch_serial, &image->activation_epoch);
+        if (error) return error;
+    }
+    return nlh_execute(image, op, argument, result, role, NLH_ORIGIN_MANAGEMENT, NULL);
 }
 
 static void nlh_release(struct nlh_image *image)
@@ -352,7 +519,8 @@ static void nlh_worker(void *unused, wait_result_t wait)
         error = EBUSY; goto done;
     }
     if (nlh.operation == NLH_INVOKE) {
-        error = nlh_call_slot(target, old->header.interface_abi, 1, nlh.argument, &result);
+        error = nlh_call_slot(target, old->header.interface_abi, 1, nlh.argument,
+                              &result, NLH_ORIGIN_USB, NULL);
         goto done;
     }
     unsigned closure = nlh_dependants(target);
@@ -378,16 +546,12 @@ static void nlh_worker(void *unused, wait_result_t wait)
         next->header = header;
         next->owner = target;
         next->memory = target * 2 + (slot->active ^ 1u);
+        if (slot->last_generation == UINT32_MAX) { error = EOVERFLOW; goto reject; }
+        next->generation = ++slot->last_generation;
+        error = nlh_identity(&nlh_image_serial, &next->cookie);
+        if (error) goto reject;
         error = nlh_resolve(next, target);
         if (error) goto reject;
-        next->host = (struct nlh_host){ NLH_ABI, sizeof(struct nlh_host), next,
-            nlh_log, nlh_now, nlh_platform, nlh_dependency_call };
-        /* Core decisions run under the caller's scheduler/VM/VFS locks.
-         * Supply no callbacks that could re-enter those resident facilities.
-         * The trusted module contract also forbids raw external calls. */
-        if (header.kind == NLH_CORE)
-            next->host = (struct nlh_host){ NLH_ABI, sizeof(struct nlh_host), next,
-                NULL, NULL, NULL, NULL };
         /* Private state may contain resident resource pointers. Keep it out
          * of KHEAP_DATA_BUFFERS; only serialized transfers are pure data. */
         next->state = kheap_alloc(KHEAP_DEFAULT, header.state_bytes, Z_WAITOK | Z_ZERO);
@@ -395,7 +559,7 @@ static void nlh_worker(void *unused, wait_result_t wait)
         error = nlh_memory_create(next->memory, nlh.upload + sizeof(header), header.code_bytes);
         if (error) goto reject;
         next->entry = (nlh_entry_fn)((uintptr_t)nlh_memory_address(next->memory) + header.entry_offset);
-        error = nlh_invoke(next, NLH_PROBE, 0, &result);
+        error = nlh_invoke(next, NLH_PROBE, 0, &result, NLH_ROLE_CANDIDATE);
         if (error) goto reject;
         if (slot->state == NLH_RUNNING) {
             transfer_data = kalloc_data(NLH_MAX_STATE, Z_WAITOK | Z_ZERO);
@@ -406,7 +570,7 @@ static void nlh_worker(void *unused, wait_result_t wait)
     error = nlh_drain(closed);
     if (error) goto reject;
     if (slot->state == NLH_RUNNING) {
-        error = nlh_invoke(old, NLH_STOP, 0, &result);
+        error = nlh_invoke(old, NLH_STOP, 0, &result, NLH_ROLE_ACTIVE);
         if (error) { slot->state = NLH_QUARANTINED; keep_closed = 1; goto reject; }
         slot->state = NLH_STOPPED;
     }
@@ -415,16 +579,18 @@ static void nlh_worker(void *unused, wait_result_t wait)
     }
     if (slot->state == NLH_STOPPED) {
         struct nlh_transfer transfer = {header.state_abi, 0, NLH_MAX_STATE, 0, transfer_data};
-        error = nlh_invoke(old, NLH_EXPORT, (uint64_t)(uintptr_t)&transfer, &result);
+        error = nlh_invoke(old, NLH_EXPORT, (uint64_t)(uintptr_t)&transfer,
+                            &result, NLH_ROLE_ACTIVE);
         if (!error && (transfer.data != transfer_data || transfer.capacity != NLH_MAX_STATE ||
             transfer.bytes > NLH_MAX_STATE || transfer.abi != header.state_abi || transfer.reserved))
             error = EINVAL;
-        if (!error) error = nlh_invoke(next, NLH_IMPORT, (uint64_t)(uintptr_t)&transfer, &result);
+        if (!error) error = nlh_invoke(next, NLH_IMPORT, (uint64_t)(uintptr_t)&transfer,
+                                      &result, NLH_ROLE_CANDIDATE);
         if (error) goto rollback; /* IMPORT has no external side effects. */
     }
-    error = nlh_invoke(next, NLH_START, 0, &result);
+    error = nlh_invoke(next, NLH_START, 0, &result, NLH_ROLE_CANDIDATE);
     if (error) {
-        recovery_error = nlh_invoke(next, NLH_STOP, 0, &result);
+        recovery_error = nlh_invoke(next, NLH_STOP, 0, &result, NLH_ROLE_CANDIDATE);
         if (recovery_error) {
             slot->state = NLH_QUARANTINED; keep_closed = 1; goto done;
         }
@@ -433,12 +599,12 @@ static void nlh_worker(void *unused, wait_result_t wait)
     if (slot->state == NLH_STOPPED) nlh_release(old);
     slot->active ^= 1u;
     slot->state = NLH_RUNNING;
-    slot->generation++;
+    slot->generation = next->generation;
     goto done;
 rollback:
     nlh_release(next);
     if (slot->state == NLH_STOPPED) {
-        recovery_error = nlh_invoke(old, NLH_START, 0, &result);
+        recovery_error = nlh_invoke(old, NLH_START, 0, &result, NLH_ROLE_ROLLBACK);
         slot->state = recovery_error ? NLH_QUARANTINED : NLH_RUNNING;
         keep_closed = recovery_error != 0;
     }
@@ -505,7 +671,7 @@ int nlh_command(const char *cmd)
             }
         }
         printf("%s\n", nlh_memory_build);
-        printf("NLH status abi=2 nonce=%u token=%u busy=%u slots=%u received=%u total=%u error=%d recovery=%d result=%llu provider=%u uptime_ns=%llu\n",
+        printf("NLH status abi=2 nonce=%u token=%u busy=%u slots=%u received=%u total=%u error=%d recovery=%d result=%llu provider=%u platform_abi=1 resident_dispatch=1 uptime_ns=%llu\n",
             (unsigned)number, nlh.token, nlh.busy, __atomic_load_n(&nlh_count, __ATOMIC_ACQUIRE),
             nlh.received, nlh.total, nlh.error, nlh.recovery_error, nlh.result,
             nlh_platform_call != NULL, nlh_now());
@@ -529,10 +695,14 @@ int nlh_command(const char *cmd)
             struct nlh_slot *s = &nlh_slots[i];
             struct nlh_header *h = &s->images[s->active].header;
             unsigned admission = __atomic_load_n(&s->admission, __ATOMIC_ACQUIRE);
-            printf("NLH module slot=%u name=%s state=%u active=%u generation=%u kind=%u interface=%u state_abi=%u deps=%u blocked=%u calls=%u\n",
+            printf("NLH module slot=%u name=%s state=%u active=%u generation=%u kind=%u interface=%u state_abi=%u deps=%u blocked=%u calls=%u image_cookie=%llu activation_epoch=%llu candidate=%u candidate_cookie=%llu candidate_epoch=%llu candidate_generation=%u\n",
                 i, s->name, s->state, h->version, s->generation, h->kind,
                 h->interface_abi, h->state_abi, h->dependency_count,
-                !!(admission & NLH_CLOSED), admission & NLH_COUNT);
+                !!(admission & NLH_CLOSED), admission & NLH_COUNT,
+                s->images[s->active].cookie, s->images[s->active].activation_epoch,
+                s->images[s->active ^ 1u].header.version,
+                s->images[s->active ^ 1u].cookie, s->images[s->active ^ 1u].activation_epoch,
+                s->images[s->active ^ 1u].generation);
         }
         goto reply;
     }

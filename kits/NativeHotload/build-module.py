@@ -6,13 +6,66 @@ RX code, and resolves no symbols from the kernel or another module.
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import struct
 import subprocess
+import shlex
+import shutil
+import tempfile
 from nlh_format import CORE_MODULES, MAX_CODE, KINDS, pack_image, parse_image
 
 ROOT = Path(__file__).resolve().parent
+
+
+def json_digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True,
+        separators=(',', ':')).encode()).hexdigest()
+
+
+def dependency_paths(path):
+    text = path.read_text().replace('\\\n', '').replace('$$', '$')
+    # Both preflight and compilation use -MT with this fixed, path-free target.
+    # This avoids mistaking a colon in an escaped filename for the separator.
+    prefix = 'nlh-module:'
+    if not text.startswith(prefix):
+        raise ValueError('Unexpected compiler dependency target')
+    paths = {Path(value).resolve() for value in shlex.split(text[len(prefix):])}
+    if not paths or any(not value.is_file() for value in paths):
+        raise ValueError('Missing compiler dependency input')
+    return paths
+
+
+def input_hashes(paths, roots):
+    inputs = {}
+    for path in sorted(paths):
+        for label, directory in roots:
+            if path.is_relative_to(directory):
+                key = label + '/' + path.relative_to(directory).as_posix()
+                if key in inputs:
+                    raise ValueError('Ambiguous module source identity: ' + key)
+                inputs[key] = hashlib.sha256(path.read_bytes()).hexdigest()
+                break
+        else:
+            raise ValueError('Undeclared module header dependency: ' + str(path))
+    return inputs
+
+
+def require_unchanged(paths, roots, expected):
+    if input_hashes(paths, roots) != expected:
+        raise ValueError('Module source/header changed during compilation; discard this build')
+
+
+def kit_hashes():
+    return {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
+            for name in ('native_hotload.h', 'native_hotload_core.h',
+                         'core/native_core_algorithms.h', 'module.ld',
+                         'nlh_format.py', 'build-module.py')}
+
+
+def tool_identity(tool):
+    return subprocess.check_output([tool, '--version'], text=True).strip()
 
 
 def check_object(data):
@@ -141,36 +194,112 @@ def main():
         if a.source.resolve() == (ROOT / 'core' / 'policy.c').resolve():
             if domain != str(CORE_MODULES[a.name]):
                 p.error('core/policy.c requires NLH_POLICY_DOMAIN matching the reserved module name')
-    a.out.mkdir(parents=True, exist_ok=False)
-    obj, elf = a.out / 'module.o', a.out / 'module.elf'
-    includes = [ROOT, ROOT / 'core', *a.include_dir]
-    compile_command = [a.clang, '--target=aarch64-none-elf', '-O2', '-ffreestanding',
+    a.source = a.source.resolve()
+    a.out = a.out.absolute()
+    includes = [ROOT.resolve(), (ROOT / 'core').resolve(),
+                *[path.resolve() for path in a.include_dir]]
+    roots = [('kit', ROOT.resolve()), ('source', a.source.parent),
+             *[('include_' + str(i), path.resolve()) for i, path in enumerate(a.include_dir)]]
+    compiler = shutil.which(a.clang)
+    linker = shutil.which(a.linker)
+    if not compiler or not linker:
+        p.error('Compiler and linker must resolve to existing executables')
+    compiler_identity, linker_identity = tool_identity(compiler), tool_identity(linker)
+    kit_inputs = kit_hashes()
+    compile_flags = ['--target=aarch64-none-elf', '-O2', '-ffreestanding',
                     '-fPIC', '-fvisibility=hidden', '-fno-stack-protector', '-fno-builtin',
                     '-fno-unwind-tables', '-fno-asynchronous-unwind-tables',
                     '-mgeneral-regs-only', '-ffixed-x18', '-mno-outline-atomics', '-mbranch-protection=none',
                     '-Wall', '-Wextra', '-Werror',
                     *[arg for path in includes for arg in ('-I', str(path))],
-                    *['-D' + d for d in a.define], '-c', str(a.source), '-o', str(obj)]
-    subprocess.run(compile_command, check=True)
-    check_object(obj.read_bytes())
-    link_command = [a.linker, '--no-undefined', '--fatal-warnings', '--orphan-handling=error',
-                    '-T', str(ROOT / 'module.ld'), str(obj), '-o', str(elf)]
-    subprocess.run(link_command, check=True)
-    code, entry, state_bytes = extract_elf(elf.read_bytes())
-    image = pack_image(code, entry, state_bytes, a.name, a.version,
-                       a.interface_abi, a.state_abi, a.kind, dependencies)
+                    *['-D' + d for d in a.define]]
+    link_flags = ['--no-undefined', '--fatal-warnings', '--orphan-handling=error',
+                  '-T', str(ROOT / 'module.ld')]
+    a.out.parent.mkdir(parents=True, exist_ok=True)
+    # A sibling exclusive lock serializes cooperating builders without ever
+    # removing or overwriting an existing output. A crashed build leaves its
+    # lock for explicit inspection rather than automatically declaring it dead.
+    lock_path = a.out.with_name('.' + a.out.name + '.build-lock')
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        with os.fdopen(lock_fd, 'w', encoding='utf-8') as lock:
+            lock.write(str(os.getpid()) + '\n')
+        if os.path.lexists(a.out):
+            raise FileExistsError('Output directory already exists: ' + str(a.out))
+        with tempfile.TemporaryDirectory(prefix='.' + a.out.name + '.stage-',
+                                         dir=a.out.parent) as temporary:
+            stage = Path(temporary) / 'artifacts'
+            stage.mkdir()
+            obj, elf = stage / 'module.o', stage / 'module.elf'
+            dependency_file, before_file = stage / 'module.d', stage / 'module-before.d'
+            dependency_command = [compiler, *compile_flags, '-MM', '-MT', 'nlh-module',
+                                  '-MF', str(before_file), str(a.source)]
+            subprocess.run(dependency_command, check=True)
+            before_paths = dependency_paths(before_file)
+            if a.source not in before_paths:
+                raise ValueError('Compiler dependency preflight omitted the module source')
+            source_inputs = input_hashes(before_paths, roots)
+            primary = input_hashes({a.source}, roots)
+            if any(source_inputs.get(key) != value for key, value in primary.items()):
+                raise ValueError('Module source changed during preflight hashing')
+            source_sha256 = next(iter(primary.values()))
+            build_inputs = {'source': str(a.source), 'source_inputs': source_inputs,
+                'compile_flags': compile_flags, 'link_flags': link_flags,
+                'compiler': compiler, 'linker': linker,
+                'compiler_identity': compiler_identity, 'linker_identity': linker_identity,
+                'kit_inputs': kit_inputs, 'image': {'name': a.name, 'version': a.version,
+                    'interface_abi': a.interface_abi, 'state_abi': a.state_abi,
+                    'kind': a.kind, 'dependencies': [list(dep) for dep in dependencies]}}
+            compile_command = [compiler, *compile_flags, '-MMD', '-MT', 'nlh-module',
+                               '-MF', str(dependency_file), '-c', str(a.source), '-o', str(obj)]
+            subprocess.run(compile_command, check=True)
+            if dependency_paths(dependency_file) != before_paths:
+                raise ValueError('Compiler dependency set changed after preflight')
+            require_unchanged(before_paths, roots, source_inputs)
+            if kit_hashes() != kit_inputs:
+                raise ValueError('Module tooling or ABI header changed during compilation')
+            check_object(obj.read_bytes())
+            link_command = [linker, *link_flags, str(obj), '-o', str(elf)]
+            subprocess.run(link_command, check=True)
+            code, entry, state_bytes = extract_elf(elf.read_bytes())
+            image = pack_image(code, entry, state_bytes, a.name, a.version,
+                               a.interface_abi, a.state_abi, a.kind, dependencies)
+            target = stage / (a.name + '.nlh')
+            target.write_bytes(image)
+            if target.read_bytes() != image:
+                raise ValueError('Packaged module image readback differs from verified bytes')
+            report = parse_image(target.read_bytes())
+            report.update(source_sha256=source_sha256,
+                image_sha256=hashlib.sha256(image).hexdigest(),
+                dependency_command=dependency_command,
+                compile_command=compile_command, link_command=link_command,
+                source_inputs=source_inputs, source_inputs_sha256=json_digest(source_inputs),
+                compiler_identity=compiler_identity, linker_identity=linker_identity,
+                kit_inputs=kit_inputs, build_inputs=build_inputs,
+                build_inputs_sha256=json_digest(build_inputs),
+                source_consistency='preflight-and-postcompile-dependency-set-and-sha256',
+                atomic_output='verified-sibling-directory-rename-with-exclusive-build-lock',
+                artifacts={path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                           for path in (obj, elf, dependency_file, before_file, target)},
+                hardware_tested=False)
+            manifest = stage / 'module.json'
+            manifest.write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
+            if json.loads(manifest.read_text(encoding='utf-8')) != report:
+                raise ValueError('Module manifest readback differs from verified metadata')
+            require_unchanged(before_paths, roots, source_inputs)
+            if kit_hashes() != kit_inputs or tool_identity(compiler) != compiler_identity or \
+                    tool_identity(linker) != linker_identity:
+                raise ValueError('Module toolchain/tooling changed before publication')
+            if os.path.lexists(a.out):
+                raise FileExistsError('Output appeared during build: ' + str(a.out))
+            if not stage.resolve().is_relative_to(a.out.parent.resolve()):
+                raise ValueError('Staging output escaped the requested parent directory')
+            # All files become visible together on the same filesystem, only
+            # after object/ELF/image/manifest and source binding checks pass.
+            stage.rename(a.out)
+    finally:
+        lock_path.unlink()
     target = a.out / (a.name + '.nlh')
-    target.write_bytes(image)
-    report = parse_image(image)
-    report.update(source_sha256=hashlib.sha256(a.source.read_bytes()).hexdigest(),
-                  image_sha256=hashlib.sha256(image).hexdigest(),
-                  compile_command=compile_command, link_command=link_command,
-                  kit_inputs={name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
-                              for name in ('native_hotload.h', 'native_hotload_core.h',
-                                           'core/native_core_algorithms.h', 'module.ld',
-                                           'nlh_format.py', 'build-module.py')},
-                  hardware_tested=False)
-    (a.out / 'module.json').write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
     print(f'{target}: {len(image)} bytes, version={a.version}, sha256={hashlib.sha256(image).hexdigest()}')
 
 
